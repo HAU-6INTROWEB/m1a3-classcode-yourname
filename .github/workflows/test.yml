@@ -1,0 +1,136 @@
+name: Autograde
+
+# Runs the test suite on every push so graders see a pass/fail at a glance, and
+# renders a screenshot of every HTML page. Each run saves a timestamped folder
+# under submission/<timestamp>/ (one image per page + a README that embeds them)
+# and links it from the run summary. Works on private repos; no Pages needed.
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # lets the preview step commit the screenshots back
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        id: tests
+        run: npx vitest run --reporter=default --reporter=json --outputFile=test-results.json
+
+      # ---- Page preview (never affects the grade) -------------------------
+      - name: Install browser for preview
+        if: always()
+        continue-on-error: true
+        run: |
+          npm i -D playwright >/dev/null 2>&1
+          npx playwright install --with-deps chromium
+
+      - name: Render page preview
+        if: always()
+        continue-on-error: true
+        run: |
+          TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+          echo "TS=$TS" >> "$GITHUB_ENV"
+          cat > shot.mjs <<'EOF'
+          import { chromium } from 'playwright'
+          import { pathToFileURL } from 'node:url'
+          import { readdirSync, mkdirSync, writeFileSync, existsSync } from 'node:fs'
+
+          const ts = process.argv[2] || 'preview'
+          const outDir = `submission/${ts}`
+          mkdirSync(outDir, { recursive: true })
+
+          // Students build their site in src/; fall back to repo root if absent.
+          const root = existsSync('src') ? 'src' : '.'
+          const skip = new Set(['node_modules', 'test', 'tests', 'submission', 'previews'])
+          function listHtml(dir, rel = '') {
+            const out = []
+            for (const e of readdirSync(dir, { withFileTypes: true })) {
+              if (e.name.startsWith('.') || skip.has(e.name)) continue
+              const r = rel ? `${rel}/${e.name}` : e.name
+              if (e.isDirectory()) out.push(...listHtml(`${dir}/${e.name}`, r))
+              else if (e.name.toLowerCase().endsWith('.html')) out.push(r)
+            }
+            return out
+          }
+          const pages = listHtml(root).sort((a, b) =>
+            (a === 'index.html' ? '' : a).localeCompare(b === 'index.html' ? '' : b))
+
+          const browser = await chromium.launch()
+          const done = []
+          try {
+            for (const rel of pages) {
+              const img = (rel.replace(/\.html$/i, '').replace(/[\/\\]/g, '-') || 'index') + '.png'
+              try {
+                const page = await browser.newPage({ viewport: { width: 1024, height: 800 } })
+                await page.goto(pathToFileURL(`${root}/${rel}`).href, { waitUntil: 'load', timeout: 15000 }).catch(() => {})
+                await page.screenshot({ path: `${outDir}/${img}`, fullPage: true })
+                await page.close()
+                done.push({ rel, img })
+              } catch {}
+            }
+          } finally {
+            await browser.close()
+          }
+          const md = [
+            `# Submission preview - ${ts}`, '',
+            'Rendered screenshot(s) of your page(s) at this submission (UTC).', '',
+            ...done.flatMap((p) => [`## ${p.rel}`, '', `![${p.rel}](./${p.img})`, '']),
+          ].join('\n')
+          writeFileSync(`${outDir}/README.md`, md)
+          console.log(`pages: ${done.length}`)
+          EOF
+          node shot.mjs "$TS"
+
+      - name: Commit preview
+        if: always()
+        continue-on-error: true
+        run: |
+          [ -n "$TS" ] && [ -d "submission/$TS" ] || exit 0
+          git config user.name "course-bot"
+          git config user.email "course-bot@users.noreply.github.com"
+          git add submission
+          git diff --cached --quiet && { echo "no preview change"; exit 0; }
+          git commit -m "📸 Page preview $TS [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Write grading summary
+        if: always()
+        run: |
+          node <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          const fs = require('fs');
+          let r;
+          try { r = JSON.parse(fs.readFileSync('test-results.json', 'utf8')); }
+          catch { console.log('## ❌ Tests did not run (build/install error)'); process.exit(0); }
+
+          const tests = r.testResults.flatMap(f => f.assertionResults);
+          const passed = tests.filter(t => t.status === 'passed').length;
+          const total = tests.length;
+
+          console.log(`## ${passed === total ? '✅' : '❌'} ${passed} / ${total} tests passed`);
+          console.log('');
+          console.log('| Result | Test |');
+          console.log('| --- | --- |');
+          for (const t of tests) {
+            const icon = t.status === 'passed' ? '✅' : '❌';
+            console.log(`| ${icon} | ${t.fullName || t.title} |`);
+          }
+          const ts = process.env.TS;
+          if (ts) {
+            const url = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/blob/${process.env.GITHUB_REF_NAME}/submission/${ts}/README.md`;
+            console.log('');
+            console.log(`📸 **Page preview:** [view rendered page(s) (${ts})](${url})`);
+          }
+          EOF
