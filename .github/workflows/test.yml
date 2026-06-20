@@ -1,15 +1,16 @@
 name: Autograde
 
 # Runs the test suite on every push so graders see a pass/fail at a glance, and
-# renders a screenshot of every HTML page. Each run saves a timestamped folder
-# under submission/<timestamp>/ (one image per page + a README that embeds them)
-# and links it from the run summary. Works on private repos; no Pages needed.
+# renders a screenshot of every HTML page. Screenshots are published to a separate
+# "previews" branch (a timestamped folder per run, one image per page + a README
+# that embeds them) and linked from the run summary. Your own working branch is
+# never touched, so there is nothing to git pull. Works on private repos; no Pages.
 on:
   push:
   workflow_dispatch:
 
 permissions:
-  contents: write   # lets the preview step commit the screenshots back
+  contents: write   # lets the preview step push to the previews branch
 
 jobs:
   test:
@@ -30,15 +31,41 @@ jobs:
         run: npx vitest run --reporter=default --reporter=json --outputFile=test-results.json
 
       # ---- Page preview (never affects the grade) -------------------------
-      - name: Install browser for preview
+      # Don't spend CI minutes spinning up a browser until there is something to
+      # render. The starter file is just an HTML comment, so a page counts as
+      # renderable only once something remains after stripping comments + whitespace.
+      - name: Check for renderable content
         if: always()
+        run: |
+          node <<'EOF' >> "$GITHUB_ENV"
+          const { readdirSync, readFileSync, existsSync } = require('node:fs')
+          const root = existsSync('src') ? 'src' : '.'
+          const skip = new Set(['node_modules', 'test', 'tests', 'submission', 'previews'])
+          function listHtml(dir, rel = '') {
+            const out = []
+            for (const e of readdirSync(dir, { withFileTypes: true })) {
+              if (e.name.startsWith('.') || skip.has(e.name)) continue
+              const r = rel ? `${rel}/${e.name}` : e.name
+              if (e.isDirectory()) out.push(...listHtml(`${dir}/${e.name}`, r))
+              else if (e.name.toLowerCase().endsWith('.html')) out.push(r)
+            }
+            return out
+          }
+          const hasContent = listHtml(root).some((rel) =>
+            readFileSync(`${root}/${rel}`, 'utf8')
+              .replace(/<!--[\s\S]*?-->/g, '').replace(/\s+/g, '').length > 0)
+          console.log(`HAS_CONTENT=${hasContent ? '1' : '0'}`)
+          EOF
+
+      - name: Install browser for preview
+        if: ${{ always() && env.HAS_CONTENT == '1' }}
         continue-on-error: true
         run: |
           npm i -D playwright >/dev/null 2>&1
           npx playwright install --with-deps chromium
 
       - name: Render page preview
-        if: always()
+        if: ${{ always() && env.HAS_CONTENT == '1' }}
         continue-on-error: true
         run: |
           TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
@@ -94,17 +121,33 @@ jobs:
           EOF
           node shot.mjs "$TS"
 
-      - name: Commit preview
-        if: always()
+      # Publish the screenshots to a dedicated "previews" branch using a separate
+      # worktree, so the student's working branch is never modified (nothing to pull).
+      - name: Publish preview to previews branch
+        if: ${{ always() && env.HAS_CONTENT == '1' }}
         continue-on-error: true
         run: |
           [ -n "$TS" ] && [ -d "submission/$TS" ] || exit 0
           git config user.name "course-bot"
           git config user.email "course-bot@users.noreply.github.com"
-          git add submission
-          git diff --cached --quiet && { echo "no preview change"; exit 0; }
-          git commit -m "📸 Page preview $TS [skip ci]"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+          WT="$RUNNER_TEMP/previews"
+          git fetch origin previews 2>/dev/null || true
+          if git show-ref --verify --quiet refs/remotes/origin/previews; then
+            git worktree add "$WT" -B previews origin/previews
+          else
+            git worktree add --detach "$WT" HEAD
+            git -C "$WT" checkout --orphan previews
+            git -C "$WT" rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          mkdir -p "$WT/submission"
+          cp -r "submission/$TS" "$WT/submission/$TS"
+
+          git -C "$WT" add submission
+          git -C "$WT" diff --cached --quiet && { echo "no preview change"; exit 0; }
+          git -C "$WT" commit -m "📸 Page preview $TS [skip ci]"
+          git -C "$WT" push origin previews
 
       - name: Write grading summary
         if: always()
@@ -129,7 +172,7 @@ jobs:
           }
           const ts = process.env.TS;
           if (ts) {
-            const url = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/blob/${process.env.GITHUB_REF_NAME}/submission/${ts}/README.md`;
+            const url = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/blob/previews/submission/${ts}/README.md`;
             console.log('');
             console.log(`📸 **Page preview:** [view rendered page(s) (${ts})](${url})`);
           }
